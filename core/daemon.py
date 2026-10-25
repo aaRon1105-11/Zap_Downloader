@@ -1,12 +1,16 @@
 """
 Core Daemon Engine
-Asynchronous proxy pipeline managing multi-link sockets, WinINet integration, and telemetry.
+Asynchronous proxy pipeline managing multi-link sockets, WinINet integration,
+in-memory DNS caching, and telemetry.
 """
 
 import asyncio
 import socket
 import winreg
 import ctypes
+import time
+import os
+import subprocess
 from .adapters import AdapterManager
 from .bonding import BondingEngine
 from .crypto import CryptoEngine
@@ -17,6 +21,24 @@ PROXY_PORT = 8080
 BUFFER_SIZE = 262144        # 256 KB buffer for zero-copy high throughput
 SOCKET_BUF_SIZE = 1048576    # 1 MB TCP send/receive window
 
+class DNSCache:
+    """In-memory DNS cache with 5-minute TTL to accelerate chunk connection setup."""
+    def __init__(self, ttl=300):
+        self.ttl = ttl
+        self.cache = {}  # host -> (ip, expire_time)
+
+    def get(self, host: str):
+        now = time.time()
+        if host in self.cache:
+            ip, exp = self.cache[host]
+            if now < exp:
+                return ip
+            del self.cache[host]
+        return None
+
+    def set(self, host: str, ip: str):
+        self.cache[host] = (ip, time.time() + self.ttl)
+
 class DualLinkDaemon:
     def __init__(self, bonding_mode="speed", encryption_enabled=False):
         self.running = True
@@ -24,6 +46,7 @@ class DualLinkDaemon:
         self.bonding = BondingEngine(mode=bonding_mode)
         self.crypto = CryptoEngine(enabled=encryption_enabled)
         self.ipc = IPCServer(self)
+        self.dns_cache = DNSCache()
         self.active_adapters = []
         self.proxy_server = None
 
@@ -35,6 +58,18 @@ class DualLinkDaemon:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
         except Exception:
             pass
+
+    async def resolve_host(self, host: str) -> str:
+        """Resolves target host using memory cache to eliminate DNS lookup latency."""
+        cached_ip = self.dns_cache.get(host)
+        if cached_ip:
+            return cached_ip
+
+        loop = asyncio.get_running_loop()
+        addrinfo = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        dest_ip = addrinfo[0][4][0]
+        self.dns_cache.set(host, dest_ip)
+        return dest_ip
 
     async def handle_client(self, client_reader, client_writer):
         try:
@@ -99,17 +134,15 @@ class DualLinkDaemon:
             remote_sock.bind((adapter.ip, 0))
             remote_sock.setblocking(False)
 
-            addrinfo = await loop.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
-            dest_ip, dest_port = addrinfo[0][4][:2]
-
-            await asyncio.wait_for(loop.sock_connect(remote_sock, (dest_ip, dest_port)), timeout=6.0)
+            dest_ip = await self.resolve_host(host)
+            await asyncio.wait_for(loop.sock_connect(remote_sock, (dest_ip, port)), timeout=6.0)
 
             client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await client_writer.drain()
 
             remote_reader, remote_writer = await asyncio.open_connection(sock=remote_sock)
 
-            # Bidirectional streaming with CPU-optimized crypto handling
+            # High-throughput bidirectional stream forwarding
             async def forward(r, w, is_download=False):
                 try:
                     drain_counter = 0
@@ -118,7 +151,6 @@ class DualLinkDaemon:
                         if not data:
                             break
 
-                        # Process via CryptoEngine: automatically bypasses double-encryption for TLS
                         processed = self.crypto.process_inbound(data, is_tls=True) if is_download else self.crypto.process_outbound(data, is_tls=True)
                         w.write(processed)
                         drain_counter += len(data)
@@ -172,10 +204,8 @@ class DualLinkDaemon:
             remote_sock.bind((adapter.ip, 0))
             remote_sock.setblocking(False)
 
-            addrinfo = await loop.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
-            dest_ip, dest_port = addrinfo[0][4][:2]
-
-            await asyncio.wait_for(loop.sock_connect(remote_sock, (dest_ip, dest_port)), timeout=6.0)
+            dest_ip = await self.resolve_host(host)
+            await asyncio.wait_for(loop.sock_connect(remote_sock, (dest_ip, port)), timeout=6.0)
             remote_reader, remote_writer = await asyncio.open_connection(sock=remote_sock)
 
             req_line = f"{method} {path} {proto}\r\n".encode('latin1')
@@ -251,10 +281,23 @@ class DualLinkDaemon:
         except Exception:
             pass
 
+    def release_stale_ports(self):
+        """Automatically detects and clears stale ports from prior crashed sessions."""
+        try:
+            # Check if port 8080 is held by another python process and terminate it gracefully
+            cmd = f'powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort {PROXY_PORT} -State Listen -ErrorAction SilentlyContinue).OwningProcess"'
+            pid = subprocess.check_output(cmd, shell=True, text=True).strip()
+            if pid and int(pid) != os.getpid():
+                subprocess.run(f"taskkill /PID {pid} /F >nul 2>&1", shell=True)
+                time.sleep(0.5)
+        except Exception:
+            pass
+
     async def start(self):
+        self.release_stale_ports()
         self.set_system_proxy(True)
         self.active_adapters = self.adapters_mgr.scan()
-        self.proxy_server = await asyncio.start_server(self.handle_client, PROXY_HOST, PROXY_PORT)
+        self.proxy_server = await asyncio.start_server(self.handle_client, PROXY_HOST, PROXY_PORT, reuse_address=True)
         await self.ipc.start()
         asyncio.create_task(self.adapter_monitor_task())
 
